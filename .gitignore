@@ -7,6 +7,7 @@ test_*
 *.tiff
 *.jpg
 *.jpeg
+*.webp
 !BuzzAldrin.jpg
 !MigrantMother.tif
 !Earthrise.jpg
