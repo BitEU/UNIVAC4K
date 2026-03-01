@@ -1,3 +1,13 @@
 /__pycache__
 /.claude
 test_*
+*.json
+*.png
+*.tif
+*.jpg
+*.jpeg
+!BuzzAldrin.jpg
+!MigrantMother.tif
+!Earthrise.jpg
+!BlackHole.jpg
+! 
