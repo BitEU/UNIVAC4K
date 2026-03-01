@@ -4,10 +4,13 @@ test_*
 *.json
 *.png
 *.tif
+*.tiff
 *.jpg
 *.jpeg
 !BuzzAldrin.jpg
 !MigrantMother.tif
 !Earthrise.jpg
 !BlackHole.jpg
-! 
+!PaleBlueDot.tif
+!Photo51.tiff
+!Ingenuity.jpg

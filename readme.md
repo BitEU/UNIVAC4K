@@ -8,6 +8,9 @@ The sample photos are from the Library of Congress, NASAm and other sources and 
 - https://apollojournals.org/afj/ap08fj/16day4_orbit4.html
 - https://www.nasa.gov/image-detail/337294main-pg62-as11-40-5903-full/
 - https://science.nasa.gov/resource/first-image-of-a-black-hole/
+- https://science.nasa.gov/resource/voyager-pale-blue-dot-download/
+- https://digital.sciencehistory.org/works/skau3rn
+- https://www.nasa.gov/image-detail/ingenuitys-blades-are-released-2/
 
 ## Usage:
 
