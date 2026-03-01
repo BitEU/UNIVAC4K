@@ -5,6 +5,9 @@ UNIVAC4K — Overstrike ASCII Art Generator
 Converts images to multi-pass overstriked ASCII art for teletype output.
 Each line can be printed multiple times (carriage return without line feed)
 to build up ink density, approximating grayscale images.
+
+Uses grayscale glyph bitmaps with a probabilistic ink accumulation model
+to achieve a wide tonal range through overstriking.
 """
 
 import argparse
@@ -20,12 +23,10 @@ PRINTABLE_CHARS = [chr(c) for c in range(0x20, 0x7F)]
 
 
 def rasterize_font(font_path, point_size=20):
-    """Render all printable ASCII characters and return their bitmaps and densities."""
+    """Render all printable ASCII characters as grayscale ink maps."""
     font = ImageFont.truetype(font_path, point_size)
 
-    # Determine cell dimensions from the monospaced font
     cell_w = int(font.getlength("M"))
-    # Use font metrics for height
     ascent, descent = font.getmetrics()
     cell_h = ascent + descent
 
@@ -36,10 +37,10 @@ def rasterize_font(font_path, point_size=20):
         img = Image.new("L", (cell_w, cell_h), 255)
         draw = ImageDraw.Draw(img)
         draw.text((0, 0), ch, font=font, fill=0)
-        # Convert to boolean array: True = ink
-        arr = np.array(img) < 128
+        # Convert to ink values: 0.0 = no ink (white), 1.0 = full ink (black)
+        arr = 1.0 - (np.array(img, dtype=np.float32) / 255.0)
         glyphs[ch] = arr
-        densities[ch] = arr.sum() / arr.size if arr.size > 0 else 0.0
+        densities[ch] = float(arr.mean())
 
     return glyphs, densities, cell_w, cell_h, font
 
@@ -49,13 +50,12 @@ def load_and_prepare_image(image_path, target_cols, cell_w, cell_h):
     img = Image.open(image_path).convert("L")
     orig_w, orig_h = img.size
 
-    # Calculate target rows preserving aspect ratio, adjusted for character cell aspect ratio
-    char_aspect = cell_w / cell_h
-    img_aspect = orig_w / orig_h
-    target_rows = int(target_cols / (img_aspect * char_aspect))
+    # Calculate target rows so physical output preserves image aspect ratio
+    # Physical width = target_cols * cell_w, physical height = target_rows * cell_h
+    # We need: (target_cols * cell_w) / (target_rows * cell_h) = orig_w / orig_h
+    target_rows = int((target_cols * cell_w * orig_h) / (cell_h * orig_w))
     target_rows = max(1, target_rows)
 
-    # Resize image to target_cols × target_rows (one pixel per character cell)
     img_resized = img.resize((target_cols, target_rows), Image.LANCZOS)
     pixels = np.array(img_resized, dtype=np.float64)
 
@@ -65,66 +65,62 @@ def load_and_prepare_image(image_path, target_cols, cell_w, cell_h):
     return target_density, target_rows
 
 
+def _accumulate_ink(current, glyph):
+    """Probabilistic ink accumulation: overstriking two ink layers.
+
+    Models each pixel as independently receiving ink.
+    Result = 1 - (1 - current)(1 - glyph)
+    """
+    return 1.0 - (1.0 - current) * (1.0 - glyph)
+
+
 def generate_passes_accurate(target_density, glyphs, max_passes):
-    """Generate overstrike passes using pixel-accurate bitmap compositing."""
+    """Generate overstrike passes using pixel-level grayscale compositing."""
     rows, cols = target_density.shape
     glyph_h, glyph_w = next(iter(glyphs.values())).shape
 
-    # Precompute glyph arrays and their densities for fast comparison
     char_list = PRINTABLE_CHARS
-    glyph_arrays = np.stack([glyphs[ch] for ch in char_list])  # (num_chars, glyph_h, glyph_w)
-    total_pixels = glyph_h * glyph_w
-
+    # (num_chars, glyph_h, glyph_w) float32
+    glyph_arrays = np.stack([glyphs[ch] for ch in char_list])
     result_lines = []
 
     for row in range(rows):
         target_row = target_density[row]
         passes = []
 
-        # Current accumulated ink per cell: array of boolean bitmaps
-        current_ink = np.zeros((cols, glyph_h, glyph_w), dtype=bool)
+        # Current accumulated ink per cell: float array
+        current_ink = np.zeros((cols, glyph_h, glyph_w), dtype=np.float32)
 
-        for pass_num in range(max_passes):
+        for _ in range(max_passes):
             pass_chars = []
 
             for col in range(cols):
                 target_d = target_row[col]
-                current_d = current_ink[col].sum() / total_pixels
+                current_d = current_ink[col].mean()
 
-                # If already close enough, use space
-                if abs(current_d - target_d) < 0.01:
+                if target_d - current_d < 0.005:
                     pass_chars.append(" ")
                     continue
 
-                # If target is less than current (can't remove ink), use space
-                if target_d <= current_d:
-                    pass_chars.append(" ")
-                    continue
+                # Accumulate each candidate glyph onto current ink
+                candidates = _accumulate_ink(current_ink[col], glyph_arrays)
+                candidate_densities = candidates.mean(axis=(1, 2))
 
-                # Try each character: OR with current ink, measure resulting density
-                candidates = current_ink[col] | glyph_arrays  # (num_chars, h, w)
-                candidate_densities = candidates.sum(axis=(1, 2)) / total_pixels
-
-                # Find character whose result is closest to target
                 errors = np.abs(candidate_densities - target_d)
-                best_idx = np.argmin(errors)
+                best_idx = int(np.argmin(errors))
 
-                best_char = char_list[best_idx]
-                # Only use if it actually improves things
                 if errors[best_idx] < abs(current_d - target_d):
                     current_ink[col] = candidates[best_idx]
-                    pass_chars.append(best_char)
+                    pass_chars.append(char_list[best_idx])
                 else:
                     pass_chars.append(" ")
 
             pass_str = "".join(pass_chars)
-            # Only add the pass if it has non-space content
             if pass_str.strip():
                 passes.append(pass_str)
 
         result_lines.append(passes)
 
-        # Progress indicator
         pct = (row + 1) / rows * 100
         print(f"\rProcessing: {pct:.0f}% ({row + 1}/{rows} rows)", end="", flush=True)
 
@@ -136,7 +132,6 @@ def generate_passes_fast(target_density, densities, max_passes):
     """Generate overstrike passes using density approximation (fast mode)."""
     rows, cols = target_density.shape
 
-    # Sort characters by density for efficient searching
     char_density_pairs = sorted(
         [(ch, d) for ch, d in densities.items()],
         key=lambda x: x[1],
@@ -151,21 +146,20 @@ def generate_passes_fast(target_density, densities, max_passes):
         passes = []
         current_density = np.zeros(cols)
 
-        for pass_num in range(max_passes):
+        for _ in range(max_passes):
             pass_chars = []
 
             for col in range(cols):
                 target_d = target_row[col]
                 current_d = current_density[col]
 
-                if abs(current_d - target_d) < 0.01 or target_d <= current_d:
+                if target_d - current_d < 0.005:
                     pass_chars.append(" ")
                     continue
 
-                # Density after overstriking: 1 - (1 - current)(1 - new_char)
                 candidate_densities = 1.0 - (1.0 - current_d) * (1.0 - density_list)
                 errors = np.abs(candidate_densities - target_d)
-                best_idx = np.argmin(errors)
+                best_idx = int(np.argmin(errors))
 
                 if errors[best_idx] < abs(current_d - target_d):
                     current_density[col] = candidate_densities[best_idx]
@@ -187,7 +181,7 @@ def generate_passes_fast(target_density, densities, max_passes):
 
 
 def render_preview(result_lines, glyphs, cell_w, cell_h, output_path):
-    """Render the overstrike result back into a preview image."""
+    """Render the overstrike result back into a preview image using grayscale compositing."""
     num_rows = len(result_lines)
     num_cols = max(
         (max(len(p) for p in passes) if passes else 0) for passes in result_lines
@@ -197,7 +191,8 @@ def render_preview(result_lines, glyphs, cell_w, cell_h, output_path):
 
     img_w = num_cols * cell_w
     img_h = num_rows * cell_h
-    preview = np.ones((img_h, img_w), dtype=bool)  # True = white (no ink)
+    # Ink map: 0.0 = no ink, 1.0 = full ink
+    ink = np.zeros((img_h, img_w), dtype=np.float32)
 
     for row_idx, passes in enumerate(result_lines):
         y = row_idx * cell_h
@@ -209,14 +204,15 @@ def render_preview(result_lines, glyphs, cell_w, cell_h, output_path):
                 glyph = glyphs.get(ch)
                 if glyph is not None:
                     gh, gw = glyph.shape
-                    # OR ink: where glyph has ink, preview gets ink (False = ink)
-                    region = preview[y : y + gh, x : x + gw]
-                    # glyph True = ink, so we AND with NOT glyph (ink darkens)
-                    preview[y : y + gh, x : x + gw] = region & ~glyph
+                    region = ink[y : y + gh, x : x + gw]
+                    ink[y : y + gh, x : x + gw] = _accumulate_ink(region, glyph)
 
-    # Convert boolean to image (True=white=255, False=black=0)
-    img_array = (preview.astype(np.uint8)) * 255
+    # Convert ink to image: ink 0 = white (255), ink 1 = black (0)
+    img_array = ((1.0 - ink) * 255).clip(0, 255).astype(np.uint8)
     img = Image.fromarray(img_array)
+    _, ext = os.path.splitext(output_path)
+    if not ext:
+        output_path += ".png"
     img.save(output_path)
     print(f"Preview saved to: {output_path}")
 
@@ -271,13 +267,18 @@ def main():
         sys.exit(1)
 
     print(f"Loading font: {FONT_PATH} at {args.font_size}pt")
-    glyphs, densities, cell_w, cell_h, font = rasterize_font(FONT_PATH, args.font_size)
+    glyphs, densities, cell_w, cell_h, _ = rasterize_font(FONT_PATH, args.font_size)
     print(f"Cell dimensions: {cell_w}x{cell_h} pixels")
     print(f"Characters loaded: {len(glyphs)}")
 
-    # Show top 10 densest characters
     sorted_by_density = sorted(densities.items(), key=lambda x: x[1], reverse=True)
     print("Densest characters: " + " ".join(f"{ch}({d:.2f})" for ch, d in sorted_by_density[:10]))
+
+    # Show achievable density range
+    max_single = sorted_by_density[0][1]
+    max_theoretical = 1.0 - (1.0 - max_single) ** args.max_passes
+    print(f"Max single-char density: {max_single:.3f}")
+    print(f"Theoretical max with {args.max_passes} passes: {max_theoretical:.3f}")
 
     print(f"\nLoading image: {args.image}")
     target_density, target_rows = load_and_prepare_image(args.image, args.width, cell_w, cell_h)
@@ -291,7 +292,6 @@ def main():
     else:
         result_lines = generate_passes_accurate(target_density, glyphs, args.max_passes)
 
-    # Count total passes used
     total_passes = sum(len(p) for p in result_lines)
     max_used = max(len(p) for p in result_lines) if result_lines else 0
     print(f"\nTotal passes across all lines: {total_passes}")
