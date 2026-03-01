@@ -1,5 +1,6 @@
 /__pycache__
 /.claude
+/Output
 test_*
 *.json
 *.png
@@ -15,3 +16,11 @@ test_*
 !PaleBlueDot.tif
 !Photo51.tiff
 !Ingenuity.jpg
+!Challenger.jpg
+!Einstein.jpg
+!JFK.webp
+!MarilynMonroe.jpg
+!NotreDame.jpg
+!Osama_Assassination.jpg
+!Saigon.jpg
+!TankMan.jpg
