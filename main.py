@@ -16,7 +16,7 @@ import os
 import sys
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "TTY35TD-Book.ttf")
 PRINTABLE_CHARS = [chr(c) for c in range(0x20, 0x7F)]
@@ -66,12 +66,77 @@ def load_and_prepare_image(image_path, target_cols, cell_w, cell_h):
     return target_ink, target_rows
 
 
+def _apply_clahe(ink_array, clip_limit=2.0, grid_size=8):
+    """Apply CLAHE adaptive histogram equalization to ink density array."""
+    try:
+        import cv2
+    except ImportError:
+        print("Warning: opencv-python not installed, skipping CLAHE. "
+              "Install with: pip install opencv-python", file=sys.stderr)
+        return ink_array
+
+    grayscale = ((1.0 - ink_array) * 255).clip(0, 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit,
+                            tileGridSize=(grid_size, grid_size))
+    equalized = clahe.apply(grayscale)
+    return 1.0 - (equalized.astype(np.float32) / 255.0)
+
+
+def _apply_gamma(ink_array, gamma=1.0):
+    """Apply gamma correction. gamma > 1 lifts shadows (makes darks lighter)."""
+    if gamma == 1.0:
+        return ink_array
+    luminance = 1.0 - ink_array.clip(0, 1)
+    corrected = np.power(luminance, 1.0 / gamma)
+    return 1.0 - corrected
+
+
+def _apply_unsharp(ink_array, radius=2, amount=100):
+    """Apply unsharp masking to boost edge detail using PIL."""
+    if amount <= 0 or radius <= 0:
+        return ink_array
+    grayscale = ((1.0 - ink_array) * 255).clip(0, 255).astype(np.uint8)
+    img = Image.fromarray(grayscale)
+    img = img.filter(ImageFilter.UnsharpMask(radius=radius, percent=int(amount), threshold=0))
+    result = np.array(img, dtype=np.float32)
+    return 1.0 - (result / 255.0)
+
+
+def _apply_density_clamp(ink_array, density_min=0.0, density_max=1.0):
+    """Linearly rescale ink density from [0, 1] to [density_min, density_max]."""
+    if density_min == 0.0 and density_max == 1.0:
+        return ink_array
+    return density_min + ink_array.clip(0, 1) * (density_max - density_min)
+
+
+def preprocess_image(target_ink, clahe_clip=0.0, clahe_grid=8, gamma=1.0,
+                     unsharp_radius=0, unsharp_amount=0,
+                     density_min=0.0, density_max=1.0):
+    """Apply preprocessing pipeline: CLAHE -> gamma -> unsharp mask -> density clamp."""
+    result = target_ink.copy()
+
+    if clahe_clip > 0:
+        result = _apply_clahe(result, clahe_clip, clahe_grid)
+
+    if gamma != 1.0:
+        result = _apply_gamma(result, gamma)
+
+    if unsharp_amount > 0 and unsharp_radius > 0:
+        result = _apply_unsharp(result, unsharp_radius, unsharp_amount)
+
+    if density_min > 0.0 or density_max < 1.0:
+        result = _apply_density_clamp(result, density_min, density_max)
+
+    return result
+
+
 def _accumulate_ink(current, glyph):
     """Probabilistic ink accumulation: 1 - (1 - current)(1 - glyph)"""
     return 1.0 - (1.0 - current) * (1.0 - glyph)
 
 
-def generate_passes_accurate(target_ink, glyphs, max_passes, cell_w, cell_h):
+def generate_passes_accurate(target_ink, glyphs, max_passes, cell_w, cell_h,
+                             dither=False, dither_strength=0.8):
     """Generate overstrike passes using pixel-level spatial matching.
 
     Instead of matching average density, this compares the full pixel grid
@@ -84,6 +149,15 @@ def generate_passes_accurate(target_ink, glyphs, max_passes, cell_w, cell_h):
     char_list = PRINTABLE_CHARS
     glyph_arrays = np.stack([glyphs[ch] for ch in char_list])  # (num_chars, cell_h, cell_w)
 
+    # For dithering: compute per-cell mean target densities for error diffusion
+    if dither:
+        cell_targets = np.zeros((rows, cols), dtype=np.float32)
+        for r in range(rows):
+            for c in range(cols):
+                cell_targets[r, c] = target_ink[
+                    r * cell_h:(r + 1) * cell_h, c * cell_w:(c + 1) * cell_w
+                ].mean()
+
     result_lines = []
 
     for row in range(rows):
@@ -93,6 +167,15 @@ def generate_passes_accurate(target_ink, glyphs, max_passes, cell_w, cell_h):
 
         # Extract target cells for this row: (cols, cell_h, cell_w)
         target_row = np.stack([target_ink[y0:y1, c * cell_w:(c + 1) * cell_w] for c in range(cols)])
+
+        # If dithering, scale pixel-level targets by the dithered cell density ratio
+        if dither:
+            for col in range(cols):
+                original_mean = target_row[col].mean()
+                if original_mean > 0.001:
+                    scale = np.clip(cell_targets[row, col] / original_mean, 0.0, 2.0)
+                    target_row[col] = (target_row[col] * scale).clip(0, 1)
+
         # Current accumulated ink per cell
         current_ink = np.zeros((cols, cell_h, cell_w), dtype=np.float32)
 
@@ -128,6 +211,20 @@ def generate_passes_accurate(target_ink, glyphs, max_passes, cell_w, cell_h):
             if pass_str.strip():
                 passes.append(pass_str)
 
+        # Floyd-Steinberg error diffusion after all passes for this row
+        if dither:
+            for col in range(cols):
+                achieved = current_ink[col].mean()
+                error = (cell_targets[row, col] - achieved) * dither_strength
+                if col + 1 < cols:
+                    cell_targets[row, col + 1] += error * 7.0 / 16.0
+                if row + 1 < rows:
+                    if col - 1 >= 0:
+                        cell_targets[row + 1, col - 1] += error * 3.0 / 16.0
+                    cell_targets[row + 1, col] += error * 5.0 / 16.0
+                    if col + 1 < cols:
+                        cell_targets[row + 1, col + 1] += error * 1.0 / 16.0
+
         result_lines.append(passes)
 
         pct = (row + 1) / rows * 100
@@ -137,7 +234,8 @@ def generate_passes_accurate(target_ink, glyphs, max_passes, cell_w, cell_h):
     return result_lines
 
 
-def generate_passes_fast(target_ink, densities, max_passes, cell_w, cell_h):
+def generate_passes_fast(target_ink, densities, max_passes, cell_w, cell_h,
+                         dither=False, dither_strength=0.8):
     """Generate overstrike passes using density approximation (fast mode).
 
     Uses per-cell average density matching instead of pixel-level comparison.
@@ -151,7 +249,7 @@ def generate_passes_fast(target_ink, densities, max_passes, cell_w, cell_h):
     density_list = np.array([p[1] for p in char_density_pairs])
 
     # Compute per-cell average target density
-    target_density = np.zeros((rows, cols))
+    target_density = np.zeros((rows, cols), dtype=np.float32)
     for r in range(rows):
         for c in range(cols):
             target_density[r, c] = target_ink[
@@ -189,6 +287,19 @@ def generate_passes_fast(target_ink, densities, max_passes, cell_w, cell_h):
             pass_str = "".join(pass_chars)
             if pass_str.strip():
                 passes.append(pass_str)
+
+        # Floyd-Steinberg error diffusion after all passes for this row
+        if dither:
+            for col in range(cols):
+                error = (target_density[row, col] - current_density[col]) * dither_strength
+                if col + 1 < cols:
+                    target_density[row, col + 1] += error * 7.0 / 16.0
+                if row + 1 < rows:
+                    if col - 1 >= 0:
+                        target_density[row + 1, col - 1] += error * 3.0 / 16.0
+                    target_density[row + 1, col] += error * 5.0 / 16.0
+                    if col + 1 < cols:
+                        target_density[row + 1, col + 1] += error * 1.0 / 16.0
 
         result_lines.append(passes)
 
@@ -273,7 +384,59 @@ def main():
         "--font-size", type=int, default=20, help="Font rendering size in points (default: 20)"
     )
 
+    # Preprocessing options
+    parser.add_argument(
+        "--clahe", type=float, default=0.0, metavar="CLIP",
+        help="Apply CLAHE adaptive histogram equalization with given clip limit "
+             "(0=off, try 2.0-4.0 for dark images)",
+    )
+    parser.add_argument(
+        "--clahe-grid", type=int, default=8,
+        help="CLAHE tile grid size (default: 8)",
+    )
+    parser.add_argument(
+        "--gamma", type=float, default=1.0,
+        help="Gamma correction: >1 lifts shadows, <1 deepens darks (default: 1.0, "
+             "try 1.5-2.2 for dark images)",
+    )
+    parser.add_argument(
+        "--sharpen", type=float, nargs=2, default=[0, 0], metavar=("RADIUS", "AMOUNT"),
+        help="Unsharp mask: radius (pixels) and amount (percent, 0-500). "
+             "Example: --sharpen 2 150",
+    )
+    parser.add_argument(
+        "--density-range", type=float, nargs=2, default=[0.0, 1.0],
+        metavar=("MIN", "MAX"),
+        help="Clamp output density to [MIN, MAX] range (default: 0.0 1.0, "
+             "try 0.02 0.85 to avoid crushing blacks)",
+    )
+    parser.add_argument(
+        "--dither", action="store_true",
+        help="Enable Floyd-Steinberg error diffusion dithering between character cells",
+    )
+    parser.add_argument(
+        "--dither-strength", type=float, default=0.8,
+        help="Dithering strength 0.0-1.0 (default: 0.8)",
+    )
+    parser.add_argument(
+        "--enhance", action="store_true",
+        help="Enable recommended preprocessing preset: CLAHE + gamma + sharpen + "
+             "density clamping + dithering",
+    )
+
     args = parser.parse_args()
+
+    # Expand --enhance preset (individual flags still override)
+    if args.enhance:
+        if args.clahe == 0.0:
+            args.clahe = 2.5
+        if args.gamma == 1.0:
+            args.gamma = 1.4
+        if args.sharpen == [0, 0]:
+            args.sharpen = [2, 120]
+        if args.density_range == [0.0, 1.0]:
+            args.density_range = [0.02, 0.85]
+        args.dither = True
 
     if not os.path.isfile(args.image):
         print(f"Error: Image file not found: {args.image}", file=sys.stderr)
@@ -300,14 +463,48 @@ def main():
     target_ink, target_rows = load_and_prepare_image(args.image, args.width, cell_w, cell_h)
     print(f"Output dimensions: {args.width} cols x {target_rows} rows")
     print(f"Image rasterized to: {target_ink.shape[1]}x{target_ink.shape[0]} pixels")
+
+    # Apply preprocessing pipeline
+    any_preprocessing = (args.clahe > 0 or args.gamma != 1.0 or
+                         args.sharpen[1] > 0 or
+                         args.density_range != [0.0, 1.0])
+    if any_preprocessing:
+        print("Preprocessing:")
+        if args.clahe > 0:
+            print(f"  CLAHE: clip={args.clahe}, grid={args.clahe_grid}")
+        if args.gamma != 1.0:
+            print(f"  Gamma: {args.gamma}")
+        if args.sharpen[1] > 0:
+            print(f"  Unsharp mask: radius={args.sharpen[0]}, amount={args.sharpen[1]:.0f}%")
+        if args.density_range != [0.0, 1.0]:
+            print(f"  Density range: [{args.density_range[0]}, {args.density_range[1]}]")
+        target_ink = preprocess_image(
+            target_ink,
+            clahe_clip=args.clahe,
+            clahe_grid=args.clahe_grid,
+            gamma=args.gamma,
+            unsharp_radius=args.sharpen[0],
+            unsharp_amount=args.sharpen[1],
+            density_min=args.density_range[0],
+            density_max=args.density_range[1],
+        )
+
     print(f"Max passes: {args.max_passes}")
     print(f"Mode: {'fast (density approximation)' if args.fast else 'accurate (pixel-level matching)'}")
+    if args.dither:
+        print(f"Dithering: Floyd-Steinberg (strength={args.dither_strength})")
     print()
 
     if args.fast:
-        result_lines = generate_passes_fast(target_ink, densities, args.max_passes, cell_w, cell_h)
+        result_lines = generate_passes_fast(target_ink, densities, args.max_passes,
+                                            cell_w, cell_h,
+                                            dither=args.dither,
+                                            dither_strength=args.dither_strength)
     else:
-        result_lines = generate_passes_accurate(target_ink, glyphs, args.max_passes, cell_w, cell_h)
+        result_lines = generate_passes_accurate(target_ink, glyphs, args.max_passes,
+                                                cell_w, cell_h,
+                                                dither=args.dither,
+                                                dither_strength=args.dither_strength)
 
     total_passes = sum(len(p) for p in result_lines)
     max_used = max(len(p) for p in result_lines) if result_lines else 0
