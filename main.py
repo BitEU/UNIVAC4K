@@ -109,6 +109,86 @@ def _apply_density_clamp(ink_array, density_min=0.0, density_max=1.0):
     return density_min + ink_array.clip(0, 1) * (density_max - density_min)
 
 
+def analyze_image(target_ink):
+    """Analyze ink density array and return adaptive preprocessing parameters.
+
+    Examines the image histogram to decide how much correction each
+    preprocessing step needs, rather than applying fixed presets.
+    """
+    mean_ink = float(target_ink.mean())
+    std_ink = float(target_ink.std())
+    dark_ratio = float(np.mean(target_ink > 0.7))   # fraction of very dark pixels
+    bright_ratio = float(np.mean(target_ink < 0.15)) # fraction of very bright pixels
+
+    # Compute edge energy via Sobel-like gradient magnitude
+    dy = np.diff(target_ink, axis=0)
+    dx = np.diff(target_ink, axis=1)
+    edge_energy = float(np.mean(np.abs(dy)) + np.mean(np.abs(dx)))
+
+    params = {}
+
+    # CLAHE: stronger when contrast is low (small std) or image is very dark
+    # Low std = flat histogram = needs redistribution
+    # High dark_ratio = lots of crushed blacks = needs local equalization
+    if std_ink < 0.15:
+        params["clahe_clip"] = 3.5  # very flat, aggressive
+    elif std_ink < 0.20:
+        params["clahe_clip"] = 2.5  # moderately flat
+    elif dark_ratio > 0.5:
+        params["clahe_clip"] = 3.0  # dark image, needs help
+    else:
+        params["clahe_clip"] = 2.0  # normal image, light touch
+
+    # Gamma: lift shadows proportional to how dark the image is
+    # mean_ink > 0.6 = very dark image, needs heavy lift
+    # mean_ink ~0.4 = balanced, light lift
+    # mean_ink < 0.3 = already bright, no gamma needed
+    if mean_ink > 0.65:
+        params["gamma"] = 2.0
+    elif mean_ink > 0.55:
+        params["gamma"] = 1.7
+    elif mean_ink > 0.45:
+        params["gamma"] = 1.4
+    elif mean_ink > 0.35:
+        params["gamma"] = 1.2
+    else:
+        params["gamma"] = 1.0  # already bright enough
+
+    # Sharpening: less if image already has strong edges
+    if edge_energy > 0.10:
+        params["sharpen"] = [1.5, 80]   # already sharp, gentle
+    elif edge_energy > 0.05:
+        params["sharpen"] = [2, 120]    # moderate
+    else:
+        params["sharpen"] = [2.5, 160]  # soft image, more sharpening
+
+    # Density range: cap max density lower for dark images to preserve gradations
+    # For bright images, allow more of the range
+    if mean_ink > 0.55:
+        params["density_max"] = 0.78  # dark image: harder cap
+    elif mean_ink > 0.40:
+        params["density_max"] = 0.85  # balanced
+    else:
+        params["density_max"] = 0.90  # bright image: allow more range
+    params["density_min"] = 0.02
+
+    # Dither strength: stronger for images with more smooth gradients (low edge energy)
+    if edge_energy < 0.04:
+        params["dither_strength"] = 1.0
+    elif edge_energy < 0.08:
+        params["dither_strength"] = 0.8
+    else:
+        params["dither_strength"] = 0.6
+
+    # Log the analysis
+    print(f"Image analysis:")
+    print(f"  Mean ink density: {mean_ink:.3f}  Std: {std_ink:.3f}")
+    print(f"  Dark pixels (>0.7): {dark_ratio:.1%}  Bright pixels (<0.15): {bright_ratio:.1%}")
+    print(f"  Edge energy: {edge_energy:.4f}")
+
+    return params
+
+
 def preprocess_image(target_ink, clahe_clip=0.0, clahe_grid=8, gamma=1.0,
                      unsharp_radius=0, unsharp_amount=0,
                      density_min=0.0, density_max=1.0):
@@ -420,23 +500,11 @@ def main():
     )
     parser.add_argument(
         "--enhance", action="store_true",
-        help="Enable recommended preprocessing preset: CLAHE + gamma + sharpen + "
-             "density clamping + dithering",
+        help="Analyze the image and automatically tune preprocessing parameters "
+             "(CLAHE, gamma, sharpening, density range, dithering)",
     )
 
     args = parser.parse_args()
-
-    # Expand --enhance preset (individual flags still override)
-    if args.enhance:
-        if args.clahe == 0.0:
-            args.clahe = 2.5
-        if args.gamma == 1.0:
-            args.gamma = 1.4
-        if args.sharpen == [0, 0]:
-            args.sharpen = [2, 120]
-        if args.density_range == [0.0, 1.0]:
-            args.density_range = [0.02, 0.85]
-        args.dither = True
 
     if not os.path.isfile(args.image):
         print(f"Error: Image file not found: {args.image}", file=sys.stderr)
@@ -463,6 +531,22 @@ def main():
     target_ink, target_rows = load_and_prepare_image(args.image, args.width, cell_w, cell_h)
     print(f"Output dimensions: {args.width} cols x {target_rows} rows")
     print(f"Image rasterized to: {target_ink.shape[1]}x{target_ink.shape[0]} pixels")
+
+    # Adaptive --enhance: analyze image and set parameters dynamically
+    if args.enhance:
+        adaptive = analyze_image(target_ink)
+        # Only apply adaptive values where the user hasn't set explicit overrides
+        if args.clahe == 0.0:
+            args.clahe = adaptive["clahe_clip"]
+        if args.gamma == 1.0:
+            args.gamma = adaptive["gamma"]
+        if args.sharpen == [0, 0]:
+            args.sharpen = adaptive["sharpen"]
+        if args.density_range == [0.0, 1.0]:
+            args.density_range = [adaptive["density_min"], adaptive["density_max"]]
+        args.dither = True
+        if args.dither_strength == 0.8:  # default wasn't overridden
+            args.dither_strength = adaptive["dither_strength"]
 
     # Apply preprocessing pipeline
     any_preprocessing = (args.clahe > 0 or args.gamma != 1.0 or
