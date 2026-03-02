@@ -215,6 +215,35 @@ def _accumulate_ink(current, glyph):
     return 1.0 - (1.0 - current) * (1.0 - glyph)
 
 
+def _fs_weights(cell_w, cell_h):
+    """Compute aspect-ratio-corrected Floyd-Steinberg error diffusion weights.
+
+    Standard F-S assumes square pixels, distributing error 7:3:5:1 to the
+    right, bottom-left, bottom, and bottom-right neighbors.  When character
+    cells are taller than wide (as on a teletype: 10 CPI horizontal,
+    6 LPI vertical gives a 5:3 aspect ratio), the vertical neighbors are
+    physically farther away and should receive proportionally less error.
+
+    The correction scales the vertical band by 1/aspect while preserving
+    the original 3:5:1 ratio among the three bottom neighbors.
+    """
+    aspect = cell_h / cell_w  # e.g. 20/12 = 1.667 for Model 35
+    if abs(aspect - 1.0) < 0.01:
+        # Square cells — use standard F-S weights
+        return 7.0 / 16.0, 3.0 / 16.0, 5.0 / 16.0, 1.0 / 16.0
+
+    h_band = 7.0              # original horizontal weight (right)
+    v_band = 9.0 / aspect     # vertical band scaled by inverse aspect
+    total = h_band + v_band
+
+    w_right = h_band / total
+    w_bl = (v_band / total) * (3.0 / 9.0)
+    w_bottom = (v_band / total) * (5.0 / 9.0)
+    w_br = (v_band / total) * (1.0 / 9.0)
+
+    return w_right, w_bl, w_bottom, w_br
+
+
 def generate_passes_accurate(target_ink, glyphs, max_passes, cell_w, cell_h,
                              dither=False, dither_strength=0.8):
     """Generate overstrike passes using pixel-level spatial matching.
@@ -229,8 +258,9 @@ def generate_passes_accurate(target_ink, glyphs, max_passes, cell_w, cell_h,
     char_list = PRINTABLE_CHARS
     glyph_arrays = np.stack([glyphs[ch] for ch in char_list])  # (num_chars, cell_h, cell_w)
 
-    # For dithering: compute per-cell mean target densities for error diffusion
+    # For dithering: compute per-cell mean target densities and F-S weights
     if dither:
+        w_right, w_bl, w_bottom, w_br = _fs_weights(cell_w, cell_h)
         cell_targets = np.zeros((rows, cols), dtype=np.float32)
         for r in range(rows):
             for c in range(cols):
@@ -297,13 +327,13 @@ def generate_passes_accurate(target_ink, glyphs, max_passes, cell_w, cell_h,
                 achieved = current_ink[col].mean()
                 error = (cell_targets[row, col] - achieved) * dither_strength
                 if col + 1 < cols:
-                    cell_targets[row, col + 1] += error * 7.0 / 16.0
+                    cell_targets[row, col + 1] += error * w_right
                 if row + 1 < rows:
                     if col - 1 >= 0:
-                        cell_targets[row + 1, col - 1] += error * 3.0 / 16.0
-                    cell_targets[row + 1, col] += error * 5.0 / 16.0
+                        cell_targets[row + 1, col - 1] += error * w_bl
+                    cell_targets[row + 1, col] += error * w_bottom
                     if col + 1 < cols:
-                        cell_targets[row + 1, col + 1] += error * 1.0 / 16.0
+                        cell_targets[row + 1, col + 1] += error * w_br
 
         result_lines.append(passes)
 
@@ -328,7 +358,8 @@ def generate_passes_fast(target_ink, densities, max_passes, cell_w, cell_h,
     char_list = [p[0] for p in char_density_pairs]
     density_list = np.array([p[1] for p in char_density_pairs])
 
-    # Compute per-cell average target density
+    # Compute per-cell average target density and F-S weights
+    w_right, w_bl, w_bottom, w_br = _fs_weights(cell_w, cell_h)
     target_density = np.zeros((rows, cols), dtype=np.float32)
     for r in range(rows):
         for c in range(cols):
@@ -373,13 +404,13 @@ def generate_passes_fast(target_ink, densities, max_passes, cell_w, cell_h,
             for col in range(cols):
                 error = (target_density[row, col] - current_density[col]) * dither_strength
                 if col + 1 < cols:
-                    target_density[row, col + 1] += error * 7.0 / 16.0
+                    target_density[row, col + 1] += error * w_right
                 if row + 1 < rows:
                     if col - 1 >= 0:
-                        target_density[row + 1, col - 1] += error * 3.0 / 16.0
-                    target_density[row + 1, col] += error * 5.0 / 16.0
+                        target_density[row + 1, col - 1] += error * w_bl
+                    target_density[row + 1, col] += error * w_bottom
                     if col + 1 < cols:
-                        target_density[row + 1, col + 1] += error * 1.0 / 16.0
+                        target_density[row + 1, col + 1] += error * w_br
 
         result_lines.append(passes)
 
@@ -576,7 +607,11 @@ def main():
     print(f"Max passes: {args.max_passes}")
     print(f"Mode: {'fast (density approximation)' if args.fast else 'accurate (pixel-level matching)'}")
     if args.dither:
-        print(f"Dithering: Floyd-Steinberg (strength={args.dither_strength})")
+        w_r, w_bl, w_b, w_br = _fs_weights(cell_w, cell_h)
+        aspect = cell_h / cell_w
+        print(f"Dithering: Floyd-Steinberg (strength={args.dither_strength}, "
+              f"cell aspect={aspect:.3f}, "
+              f"weights=[R={w_r:.3f} BL={w_bl:.3f} B={w_b:.3f} BR={w_br:.3f}])")
     print()
 
     if args.fast:
