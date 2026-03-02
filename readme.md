@@ -35,4 +35,4 @@ Options:
 --font-size — Font rendering size in points (default: 20)
 ```
 
-```python main.py sample.tif -p 20 --preview PREVIEW```
+```python main.py ./Sample/Earthrise.jpg -p 20 --enhance --preview Earthrise```
